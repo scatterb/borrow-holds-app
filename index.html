@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Library status</title>
+<style>
+/* App chrome only; the status page brings its own styles. */
+:root {
+  --bg: #f5f6f8; --card: #ffffff; --text: #1d2026; --muted: #6b7280; --line: #e5e7eb;
+  --btn: #1d2026; --btn-text: #ffffff; --accent-ui: #2563eb; --danger: #c62828;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #14161a; --card: #1e2126; --text: #e8eaed; --muted: #9aa0a8; --line: #2e3238;
+    --btn: #e8eaed; --btn-text: #14161a; --accent-ui: #6ea2ff; --danger: #ef6b6b; }
+}
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.toolbar { display: flex; justify-content: flex-end; gap: 8px; max-width: 1500px; margin: 0 auto; padding: 10px 16px 0; }
+button, .btn { font: inherit; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text);
+  padding: 6px 12px; cursor: pointer; }
+button.primary { background: var(--btn); color: var(--btn-text); border-color: var(--btn); }
+button:disabled { opacity: .5; cursor: default; }
+.setup { max-width: 520px; margin: 40px auto; padding: 0 16px; }
+.setup label { display: block; margin: 14px 0 4px; font-weight: 600; }
+.setup input { width: 100%; box-sizing: border-box; font: inherit; padding: 8px 10px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--card); color: var(--text); }
+.setup ol { padding-left: 20px; color: var(--muted); }
+.message { max-width: 1500px; margin: 16px auto; padding: 0 16px; color: var(--muted); }
+.message.error { color: var(--danger); }
+/* Controls added to the status page */
+.ctl-star { border: 0; background: none; padding: 0 4px 0 0; font-size: 18px; line-height: 1; color: var(--muted); vertical-align: -1px; }
+.ctl-star.on { color: #e6a700; }
+.ctl-return { font-size: 12px; padding: 2px 8px; border-radius: 6px; }
+.ctl-return.on { background: var(--accent, var(--accent-ui)); border-color: transparent; color: #fff; }
+.ctl-pause { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 8px 0 2px; font-size: 13px; }
+.ctl-pause input { width: 56px; font: inherit; padding: 3px 6px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--card); color: var(--text); }
+.ctl-pause .hint { color: var(--muted); }
+.ctl-pause .paused { font-weight: 600; color: var(--accent, var(--accent-ui)); }
+.savebar { position: fixed; left: 0; right: 0; bottom: 0; display: none; justify-content: center; gap: 8px; flex-wrap: wrap;
+  align-items: center; padding: 10px 16px calc(10px + env(safe-area-inset-bottom)); background: var(--card);
+  border-top: 1px solid var(--line); box-shadow: 0 -4px 16px rgba(0,0,0,.08); z-index: 10; }
+.savebar.show { display: flex; }
+.savebar .info { color: var(--muted); margin-right: 6px; }
+body.has-savebar { padding-bottom: 70px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div class="savebar" id="savebar">
+  <span class="info" id="savebar-info">Unsaved changes</span>
+  <button id="save">Save</button>
+  <button class="primary" id="save-run">Save &amp; run now</button>
+</div>
+<script>
+"use strict";
+const WORKFLOW = "daily.yml";
+const REPORT_PATH = "data/library-status.html";
+const SETTINGS_PATH = "data/settings.json";
+const DEFAULT_REPO = "scatterb/borrow-holds";
+
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+  del(k) { try { localStorage.removeItem(k); } catch {} },
+};
+const app = document.getElementById("app");
+let settings, settingsSha, dirty = false, polling = null;
+
+// ---------- GitHub API ----------
+function cfg() { return { repo: store.get("repo"), token: store.get("token") }; }
+
+async function gh(path, opts = {}) {
+  const { repo, token } = cfg();
+  const res = await fetch(`https://api.github.com/repos/${repo}${path}`, {
+    ...opts,
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json",
+               "X-GitHub-Api-Version": "2022-11-28", ...(opts.headers || {}) },
+    cache: "no-store",
+  });
+  if (!res.ok && res.status !== 404) {
+    const msg = (await res.json().catch(() => ({}))).message || res.statusText;
+    throw new Error(`GitHub ${res.status}: ${msg}`);
+  }
+  return res;
+}
+
+const b64decode = s => new TextDecoder().decode(Uint8Array.from(atob(s.replace(/\n/g, "")), c => c.charCodeAt(0)));
+const b64encode = s => { let bin = ""; new TextEncoder().encode(s).forEach(b => bin += String.fromCharCode(b)); return btoa(bin); };
+
+async function getFile(path) {
+  const res = await gh(`/contents/${path}?ref=main`);
+  if (res.status === 404) return null;
+  const j = await res.json();
+  return { text: b64decode(j.content), sha: j.sha };
+}
+
+async function putSettings() {
+  const body = JSON.stringify(settings, null, 2) + "\n";
+  const send = sha => gh(`/contents/${SETTINGS_PATH}`, { method: "PUT", body: JSON.stringify({
+    message: "Update settings from phone app", content: b64encode(body), branch: "main", ...(sha ? { sha } : {}) }) });
+  let res;
+  try { res = await send(settingsSha); }
+  catch (e) {
+    // Someone (e.g. the daily run) changed the file meanwhile: take the latest sha and overwrite with ours.
+    if (!/GitHub 409|GitHub 422/.test(e.message)) throw e;
+    settingsSha = (await getFile(SETTINGS_PATH))?.sha;
+    res = await send(settingsSha);
+  }
+  settingsSha = (await res.json()).content.sha;
+}
+
+// ---------- dates ----------
+const pad = n => String(n).padStart(2, "0");
+const iso = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const parseIso = s => { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); };
+const fi = d => `${d.getDate()}.${d.getMonth() + 1}.${d.getFullYear()}`;
+const today = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; };
+const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+
+// ---------- views ----------
+function setupView(error) {
+  document.body.classList.remove("has-savebar");
+  app.innerHTML = `
+  <div class="setup">
+    <h1>Library status</h1>
+    <p>This page shows your Vaski status from your private <b>borrow-holds</b> repository and lets you change its settings.
+       It needs a GitHub access token, stored only in this browser.</p>
+    <ol>
+      <li>GitHub → Settings → Developer settings → Personal access tokens → <b>Fine-grained tokens</b> → Generate new token.</li>
+      <li>Repository access: <b>Only select repositories</b> → borrow-holds.</li>
+      <li>Permissions: <b>Contents: Read and write</b>, <b>Actions: Read and write</b>. Nothing else (in particular not Workflows).</li>
+    </ol>
+    ${error ? `<p class="message error" style="padding:0">${escapeHtml(error)}</p>` : ""}
+    <form id="setup-form">
+      <label for="repo">Repository</label>
+      <input id="repo" value="${escapeHtml(store.get("repo") || DEFAULT_REPO)}" autocomplete="off" required>
+      <label for="token">Access token</label>
+      <input id="token" type="password" autocomplete="off" required placeholder="github_pat_…">
+      <p><button class="primary" type="submit">Connect</button></p>
+    </form>
+  </div>`;
+  document.getElementById("setup-form").onsubmit = e => {
+    e.preventDefault();
+    store.set("repo", document.getElementById("repo").value.trim());
+    store.set("token", document.getElementById("token").value.trim());
+    load();
+  };
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function toolbar(extra = "") {
+  return `<div class="toolbar">${extra}<button id="refresh">↻ Refresh</button><button id="signout">Sign out</button></div>`;
+}
+
+function bindToolbar() {
+  document.getElementById("refresh").onclick = () => {
+    if (dirty && !confirm("Discard unsaved changes?")) return;
+    load();
+  };
+  document.getElementById("signout").onclick = () => {
+    if (!confirm("Remove the access token from this browser?")) return;
+    store.del("token"); setupView();
+  };
+}
+
+async function load() {
+  const { repo, token } = cfg();
+  if (!repo || !token) return setupView();
+  app.innerHTML = `<p class="message">Loading…</p>`;
+  try {
+    const [report, settingsFile] = await Promise.all([getFile(REPORT_PATH), getFile(SETTINGS_PATH)]);
+    settings = Object.assign({ priority: {}, returning: [], paused_until: {} },
+                             settingsFile ? JSON.parse(settingsFile.text) : {});
+    settingsSha = settingsFile?.sha;
+    setDirty(false);
+    if (!report) {
+      app.innerHTML = toolbar() + `<p class="message">No status page yet. It appears after the next daily run, or start one with “Run now”.</p>`;
+      app.querySelector(".toolbar").insertAdjacentHTML("afterbegin", `<button id="run-only">Run now</button>`);
+      bindToolbar();
+      document.getElementById("run-only").onclick = () => runNow().catch(e => notify(e.message, true));
+      return;
+    }
+    renderReport(report.text);
+  } catch (e) {
+    if (/GitHub 401|GitHub 403/.test(e.message)) return setupView("The token was not accepted: " + e.message);
+    app.innerHTML = toolbar() + `<p class="message error">${escapeHtml(e.message)}</p>`;
+    bindToolbar();
+  }
+}
+
+function renderReport(htmlText) {
+  const doc = new DOMParser().parseFromString(htmlText, "text/html");
+  let style = document.getElementById("report-style");
+  if (!style) { style = document.createElement("style"); style.id = "report-style"; document.head.prepend(style); }
+  style.textContent = [...doc.querySelectorAll("style")].map(s => s.textContent).join("\n");
+  app.innerHTML = toolbar() + (doc.querySelector("main")?.outerHTML || "");
+  bindToolbar();
+  enhance();
+}
+
+// ---------- controls on the status page ----------
+function enhance() {
+  const t = today();
+  for (const card of app.querySelectorAll("section.card[data-managed='1']")) {
+    const cat = card.dataset.cat;
+
+    // Prioritise (star) reservations.
+    for (const row of card.querySelectorAll("tr.hold[data-key]")) {
+      const key = row.dataset.key;
+      if (!key) continue;
+      row.querySelector(".star")?.remove();
+      const btn = document.createElement("button");
+      btn.className = "ctl-star";
+      btn.title = "Prioritise: comes first in this format's queue";
+      const paint = () => {
+        const on = (settings.priority[cat] || []).includes(key);
+        btn.classList.toggle("on", on);
+        btn.textContent = on ? "★" : "☆";
+        btn.setAttribute("aria-pressed", on);
+      };
+      btn.onclick = () => {
+        const list = settings.priority[cat] || (settings.priority[cat] = []);
+        const i = list.indexOf(key);
+        i >= 0 ? list.splice(i, 1) : list.push(key);
+        paint(); setDirty(true);
+      };
+      paint();
+      row.querySelector("td.title").prepend(btn);
+    }
+
+    // Mark loans as returning.
+    for (const row of card.querySelectorAll("tr.loan[data-record]")) {
+      const id = row.dataset.record;
+      if (!id) continue;
+      const cell = row.querySelector("td.badges");
+      cell.querySelector(".badge.info")?.remove();
+      cell.classList.remove("empty");
+      const btn = document.createElement("button");
+      btn.className = "ctl-return";
+      btn.title = "Done with it: release the next one in this format now";
+      const paint = () => {
+        const on = settings.returning.includes(id);
+        btn.classList.toggle("on", on);
+        btn.textContent = on ? "Returning ✓" : "Done";
+      };
+      btn.onclick = () => {
+        const i = settings.returning.indexOf(id);
+        i >= 0 ? settings.returning.splice(i, 1) : settings.returning.push(id);
+        paint(); setDirty(true);
+      };
+      paint();
+      cell.prepend(btn);
+    }
+
+    // Pause the whole format for N days.
+    const box = document.createElement("div");
+    box.className = "ctl-pause";
+    const release = parseIso(card.dataset.release || iso(t));
+    const paintPause = () => {
+      const until = settings.paused_until[cat];
+      if (until && parseIso(until) >= t) {
+        box.innerHTML = `<span class="paused">Paused by you until ${fi(parseIso(until))}</span> <button class="ctl-clear">Remove pause</button>`;
+        box.querySelector(".ctl-clear").onclick = () => { delete settings.paused_until[cat]; paintPause(); setDirty(true); };
+      } else {
+        box.innerHTML = `Busy with something of my own: move everything
+          <input type="number" min="1" max="365" value="14" inputmode="numeric" aria-label="days"> days later
+          <button class="ctl-apply">Pause</button> <span class="hint"></span>`;
+        const input = box.querySelector("input"), hint = box.querySelector(".hint");
+        const target = () => addDays(release > t ? release : t, Math.max(1, parseInt(input.value, 10) || 0));
+        const showHint = () => hint.textContent = `→ nothing new before ${fi(target())}`;
+        input.oninput = showHint; showHint();
+        box.querySelector(".ctl-apply").onclick = () => { settings.paused_until[cat] = iso(target()); paintPause(); setDirty(true); };
+      }
+    };
+    paintPause();
+    (card.querySelector(".release") || card.querySelector("header")).after(box);
+  }
+}
+
+// Drop settings that no longer match anything on the page (returned loans, collected holds, past pauses).
+function pruneSettings() {
+  const t = iso(today());
+  const loanIds = new Set([...app.querySelectorAll("tr.loan[data-record]")].map(r => r.dataset.record));
+  const holdKeys = new Set([...app.querySelectorAll("tr.hold[data-key]")].map(r => r.dataset.key));
+  settings.returning = settings.returning.filter(id => loanIds.has(id));
+  for (const cat of Object.keys(settings.priority)) {
+    settings.priority[cat] = settings.priority[cat].filter(k => holdKeys.has(k));
+    if (!settings.priority[cat].length) delete settings.priority[cat];
+  }
+  for (const [cat, until] of Object.entries(settings.paused_until)) if (until < t) delete settings.paused_until[cat];
+}
+
+// ---------- saving & running ----------
+const bar = document.getElementById("savebar"), barInfo = document.getElementById("savebar-info");
+function setDirty(on) {
+  dirty = on;
+  bar.classList.toggle("show", on);
+  document.body.classList.toggle("has-savebar", on);
+  if (on) barInfo.textContent = "Unsaved changes";
+}
+
+async function save() {
+  pruneSettings();
+  await putSettings();
+  setDirty(false);
+}
+
+async function runNow() {
+  const res = await gh(`/actions/workflows/${WORKFLOW}/dispatches`, { method: "POST",
+    body: JSON.stringify({ ref: "main", inputs: { apply: "true" } }) });
+  if (res.status === 404) throw new Error("Workflow not found (is the token allowed to use Actions?)");
+  notify("Run started. The page refreshes when it has finished (about 1–2 minutes).");
+  pollRun(Date.now());
+}
+
+function notify(text, isError) {
+  let el = document.getElementById("notice");
+  if (!el) { el = document.createElement("p"); el.id = "notice"; app.querySelector(".toolbar").after(el); }
+  el.className = "message" + (isError ? " error" : "");
+  el.textContent = text;
+}
+
+function pollRun(startedAt) {
+  clearInterval(polling);
+  let tries = 0;
+  polling = setInterval(async () => {
+    try {
+      tries++;
+      const runs = await (await gh(`/actions/workflows/${WORKFLOW}/runs?per_page=1&event=workflow_dispatch`)).json();
+      const run = runs.workflow_runs?.[0];
+      if (run && Date.parse(run.created_at) >= startedAt - 60000 && run.status === "completed") {
+        clearInterval(polling);
+        await load();
+        if (run.conclusion !== "success") notify(`The run finished with “${run.conclusion}”. Open GitHub Actions for details.`, true);
+      } else if (tries > 40) {
+        clearInterval(polling);
+        notify("The run is taking long. Refresh later.");
+      }
+    } catch (e) { clearInterval(polling); notify(e.message, true); }
+  }, 8000);
+}
+
+async function withBusy(fn) {
+  const buttons = bar.querySelectorAll("button");
+  buttons.forEach(b => b.disabled = true);
+  barInfo.textContent = "Saving…";
+  try { await fn(); }
+  catch (e) { barInfo.textContent = "Failed: " + e.message; }
+  finally { buttons.forEach(b => b.disabled = false); }
+}
+document.getElementById("save").onclick = () => withBusy(async () => {
+  await save(); notify("Saved. The next daily run uses these settings.");
+});
+document.getElementById("save-run").onclick = () => withBusy(async () => { await save(); await runNow(); });
+window.addEventListener("beforeunload", e => { if (dirty) e.preventDefault(); });
+
+load();
+</script>
+</body>
+</html>
