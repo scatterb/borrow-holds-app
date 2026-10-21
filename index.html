@@ -21,7 +21,18 @@
 }
 body { margin: 0; background: var(--bg); color: var(--text);
   font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-.toolbar { display: flex; justify-content: flex-end; gap: 8px; max-width: 1500px; margin: 0 auto; padding: 10px 16px 0; }
+.toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; max-width: 1500px;
+  margin: 0 auto; padding: 10px 16px 0; }
+.toolbar .status { margin-right: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; color: var(--muted); }
+.toolbar .run { color: inherit; text-decoration: none; }
+.toolbar .run.failed { color: var(--danger); font-weight: 600; }
+.toolbar .run.running { color: var(--accent-ui); }
+button.warn { color: var(--danger); border-color: var(--danger); }
+@media (max-width: 600px) {
+  .toolbar .status { flex-basis: 100%; }
+  .toolbar .status:empty { display: none; }
+  .toolbar button { padding: 6px 10px; }
+}
 button, .btn { font: inherit; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text);
   padding: 6px 12px; cursor: pointer; }
 button.primary { background: var(--btn); color: var(--btn-text); border-color: var(--btn); }
@@ -31,6 +42,8 @@ button:disabled { opacity: .5; cursor: default; }
 .setup input { width: 100%; box-sizing: border-box; font: inherit; padding: 8px 10px; border-radius: 8px;
   border: 1px solid var(--line); background: var(--card); color: var(--text); }
 .setup ol { padding-left: 20px; color: var(--muted); }
+.setup .hint { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+.setup .actions { display: flex; gap: 8px; margin-top: 18px; }
 .message { max-width: 1500px; margin: 16px auto; padding: 0 16px; color: var(--muted); }
 .message.error { color: var(--danger); }
 /* Controls added to the status page */
@@ -63,6 +76,7 @@ body.has-savebar { padding-bottom: 70px; }
 <div id="app"></div>
 <div class="savebar" id="savebar">
   <span class="info" id="savebar-info">Unsaved changes</span>
+  <button id="discard">Discard</button>
   <button id="save">Save</button>
   <button class="primary" id="save-run">Save &amp; run now</button>
 </div>
@@ -72,14 +86,20 @@ const WORKFLOW = "daily.yml";
 const REPORT_PATH = "data/library-status.html";
 const SETTINGS_PATH = "data/settings.json";
 const DEFAULT_REPO = "scatterb/borrow-holds";
+const STALE_MS = 5 * 60 * 1000;    // refetch when the app comes back after this long
+const TOKEN_WARN_DAYS = 14;
 
 const store = {
   get(k) { try { return localStorage.getItem(k); } catch { return null; } },
   set(k, v) { try { localStorage.setItem(k, v); } catch {} },
   del(k) { try { localStorage.removeItem(k); } catch {} },
+  json(k) { try { return JSON.parse(this.get(k)); } catch { return null; } },
+  setJson(k, v) { this.set(k, JSON.stringify(v)); },
 };
 const app = document.getElementById("app");
-let settings, settingsSha, dirty = false, polling = null;
+// base: settings.json as last read from GitHub; settings: the same with the user's edits.
+let reportText = null, base = null, settings = null, settingsSha, dirty = false;
+let polling = null, busy = false, loading = null, fetchedAt = 0, lastRun = null;
 
 // ---------- GitHub API ----------
 function cfg() { return { repo: store.get("repo"), token: store.get("token") }; }
@@ -109,19 +129,75 @@ async function getFile(path) {
   return { text: b64decode(j.content), sha: j.sha };
 }
 
+async function getLastRun() {
+  const res = await gh(`/actions/workflows/${WORKFLOW}/runs?per_page=1`);
+  return res.status === 404 ? null : (await res.json()).workflow_runs?.[0] || null;
+}
+
+// Returns true when the file had changed on GitHub and our edits were merged onto the newer version.
 async function putSettings() {
-  const body = JSON.stringify(settings, null, 2) + "\n";
-  const send = sha => gh(`/contents/${SETTINGS_PATH}`, { method: "PUT", body: JSON.stringify({
-    message: "Update settings from phone app", content: b64encode(body), branch: "main", ...(sha ? { sha } : {}) }) });
-  let res;
-  try { res = await send(settingsSha); }
+  const send = () => gh(`/contents/${SETTINGS_PATH}`, { method: "PUT", body: JSON.stringify({
+    message: "Update settings from phone app", content: b64encode(JSON.stringify(settings, null, 2) + "\n"),
+    branch: "main", ...(settingsSha ? { sha: settingsSha } : {}) }) });
+  let res, merged = false;
+  try { res = await send(); }
   catch (e) {
-    // Someone (e.g. the daily run) changed the file meanwhile: take the latest sha and overwrite with ours.
+    // Someone (e.g. the daily run) changed the file meanwhile: apply our edits on top of the latest version.
     if (!/GitHub 409|GitHub 422/.test(e.message)) throw e;
-    settingsSha = (await getFile(SETTINGS_PATH))?.sha;
-    res = await send(settingsSha);
+    const latest = await getFile(SETTINGS_PATH), remote = parseSettings(latest?.text);
+    settings = mergeSettings(base, settings, remote);
+    base = remote; settingsSha = latest?.sha; merged = true;
+    res = await send();
   }
   settingsSha = (await res.json()).content.sha;
+  return merged;
+}
+
+// ---------- settings ----------
+const defaultSettings = () => ({ priority: {}, returning: [], paused_until: {} });
+const parseSettings = text => Object.assign(defaultSettings(), text ? JSON.parse(text) : {});
+const clone = o => JSON.parse(JSON.stringify(o));
+const keysOf = (...objs) => new Set(objs.flatMap(o => Object.keys(o || {})));
+
+// Three-way merge: apply the edits that turned `from` into `to` on top of `onto`.
+function mergeSettings(from, to, onto) {
+  const out = clone(onto);
+  const mergeList = (a = [], b = [], c = []) => {
+    const removed = a.filter(x => !b.includes(x));
+    return [...c.filter(x => !removed.includes(x)), ...b.filter(x => !a.includes(x) && !c.includes(x))];
+  };
+  out.returning = mergeList(from.returning, to.returning, onto.returning);
+  for (const cat of keysOf(from.priority, to.priority, onto.priority)) {
+    const list = mergeList(from.priority[cat], to.priority[cat], onto.priority[cat]);
+    list.length ? out.priority[cat] = list : delete out.priority[cat];
+  }
+  for (const cat of keysOf(from.paused_until, to.paused_until)) {
+    const until = to.paused_until[cat];
+    if (until === from.paused_until[cat]) continue;
+    until ? out.paused_until[cat] = until : delete out.paused_until[cat];
+  }
+  for (const k of Object.keys(to))
+    if (!(k in defaultSettings()) && JSON.stringify(from[k]) !== JSON.stringify(to[k])) out[k] = clone(to[k]);
+  return out;
+}
+
+// Unsaved edits as short phrases, e.g. ["2 starred", "1 returning"].
+function changeSummary() {
+  if (!base || !settings) return [];
+  const diff = (a = [], b = []) => [b.filter(x => !a.includes(x)).length, a.filter(x => !b.includes(x)).length];
+  let starred = 0, unstarred = 0, paused = 0, unpaused = 0;
+  for (const cat of keysOf(base.priority, settings.priority)) {
+    const [add, rem] = diff(base.priority[cat], settings.priority[cat]);
+    starred += add; unstarred += rem;
+  }
+  const [returning, notReturning] = diff(base.returning, settings.returning);
+  for (const cat of keysOf(base.paused_until, settings.paused_until)) {
+    const until = settings.paused_until[cat];
+    if (until !== base.paused_until[cat]) until ? paused++ : unpaused++;
+  }
+  return [[starred, "starred"], [unstarred, "unstarred"], [returning, "returning"], [notReturning, "not returning"],
+          [paused, paused === 1 ? "pause" : "pauses"], [unpaused, unpaused === 1 ? "pause removed" : "pauses removed"]]
+    .filter(([n]) => n).map(([n, text]) => `${n} ${text}`);
 }
 
 // ---------- dates ----------
@@ -131,10 +207,20 @@ const parseIso = s => { const [y, m, d] = s.split("-").map(Number); return new D
 const fi = d => `${d.getDate()}.${d.getMonth() + 1}.${d.getFullYear()}`;
 const today = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; };
 const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+const daysFrom = (a, b) => Math.round((b - a) / 86400000);
+function when(t) {
+  const d = new Date(t), day = new Date(d); day.setHours(0, 0, 0, 0);
+  const ago = daysFrom(day, today());
+  return `${ago === 0 ? "today" : ago === 1 ? "yesterday" : `${d.getDate()}.${d.getMonth() + 1}.`} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
 
 // ---------- views ----------
 function setupView(error) {
+  stopPolling();
+  fetchedAt = 0;
+  bar.classList.remove("show");
   document.body.classList.remove("has-savebar");
+  const hasToken = !!store.get("token");
   app.innerHTML = `
   <div class="setup">
     <h1>Library status</h1>
@@ -151,62 +237,137 @@ function setupView(error) {
       <input id="repo" value="${escapeHtml(store.get("repo") || DEFAULT_REPO)}" autocomplete="off" required>
       <label for="token">Access token</label>
       <input id="token" type="password" autocomplete="off" required placeholder="github_pat_…">
-      <p><button class="primary" type="submit">Connect</button></p>
+      <label for="expires">Token expires on (optional)</label>
+      <input id="expires" type="date" value="${escapeHtml(store.get("tokenExpires") || "")}">
+      <p class="hint">The expiration date you picked on GitHub. The page reminds you ${TOKEN_WARN_DAYS} days before.</p>
+      <div class="actions">
+        <button class="primary" type="submit">Connect</button>
+        ${hasToken ? `<button type="button" id="setup-cancel">Cancel</button>` : ""}
+      </div>
     </form>
   </div>`;
   document.getElementById("setup-form").onsubmit = e => {
     e.preventDefault();
     store.set("repo", document.getElementById("repo").value.trim());
     store.set("token", document.getElementById("token").value.trim());
+    const expires = document.getElementById("expires").value;
+    expires ? store.set("tokenExpires", expires) : store.del("tokenExpires");
+    // Start over from the cache and draft of this repository.
+    reportText = base = settings = null;
     load();
   };
+  if (hasToken) document.getElementById("setup-cancel").onclick = () => load();
 }
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-function toolbar(extra = "") {
-  return `<div class="toolbar">${extra}<button id="refresh">↻ Refresh</button><button id="signout">Sign out</button></div>`;
+function statusHtml() {
+  let html = "";
+  if (polling) html += `<span class="run running">Run in progress…</span>`;
+  else if (lastRun) {
+    const done = lastRun.status === "completed", ok = lastRun.conclusion === "success";
+    html += `<a class="run${done && !ok ? " failed" : ""}" href="${escapeHtml(lastRun.html_url)}" target="_blank" rel="noopener"
+      title="${done ? escapeHtml(lastRun.conclusion) : "running"}">Last run ${when(lastRun.created_at)} ${!done ? "…" : ok ? "✓" : "✗"}</a>`;
+  }
+  const expires = store.get("tokenExpires");
+  if (expires) {
+    const days = daysFrom(today(), parseIso(expires));
+    if (days <= TOKEN_WARN_DAYS)
+      html += `<button class="warn" id="renew">${days < 0 ? "Token expired" : days === 0 ? "Token expires today" : `Token expires in ${days} d`}</button>`;
+  }
+  return html;
+}
+
+function toolbar() {
+  return `<div class="toolbar"><span class="status">${statusHtml()}</span>
+    <button id="toggle-all" hidden></button><button id="run">▶ Run</button>
+    <button id="refresh">↻ Refresh</button><button id="signout">Sign out</button></div>`;
 }
 
 function bindToolbar() {
-  document.getElementById("refresh").onclick = () => {
-    if (dirty && !confirm("Discard unsaved changes?")) return;
-    load();
-  };
+  document.getElementById("refresh").onclick = () => load();
   document.getElementById("signout").onclick = () => {
-    if (!confirm("Remove the access token from this browser?")) return;
-    store.del("token"); setupView();
+    if (!confirm("Remove the access token and the saved copy from this browser?" + (dirty ? " Unsaved changes are lost." : ""))) return;
+    for (const k of ["token", "cache", "draft"]) store.del(k);
+    reportText = base = settings = lastRun = null;
+    setDirty(false);
+    navigator.clearAppBadge?.().catch(() => {});
+    setupView();
   };
+  document.getElementById("run").onclick = () => dirty
+    ? withBusy(async () => { await save(); await runNow(); })
+    : runNow().catch(e => notify(e.message, true));
+  document.getElementById("toggle-all").onclick = () => {
+    const cards = collapsibleCards(), open = !cards.every(c => c.classList.contains("open"));
+    cards.forEach(c => setCardOpen(c, open));
+  };
+  paintStatus();
 }
 
-async function load() {
+function paintStatus() {
+  const status = app.querySelector(".toolbar .status");
+  if (!status) return;
+  status.innerHTML = statusHtml();
+  const renew = document.getElementById("renew");
+  if (renew) renew.onclick = () => (!dirty || confirm("Unsaved changes stay as a draft. Continue?")) && setupView();
+  document.getElementById("run").disabled = !!polling;
+}
+
+function load() {
+  if (!loading) loading = fetchAll().finally(() => loading = null);
+  return loading;
+}
+
+async function fetchAll() {
   const { repo, token } = cfg();
   if (!repo || !token) return setupView();
-  app.innerHTML = `<p class="message">Loading…</p>`;
+  const draft = store.json("draft");
+  if (reportText === null) {
+    // First load: show the saved copy (with any unsaved draft) right away, then update it.
+    const cache = store.json("cache");
+    if (cache?.repo === repo && cache.report) {
+      base = parseSettings(cache.settings);
+      settings = draft?.repo === repo ? mergeSettings(draft.base, draft.settings, base) : clone(base);
+      renderReport(cache.report);
+      changed();
+      notify(`Showing the copy from ${when(cache.at)}. Updating…`);
+    } else app.innerHTML = `<p class="message">Loading…</p>`;
+  }
   try {
-    const [report, settingsFile] = await Promise.all([getFile(REPORT_PATH), getFile(SETTINGS_PATH)]);
-    settings = Object.assign({ priority: {}, returning: [], paused_until: {} },
-                             settingsFile ? JSON.parse(settingsFile.text) : {});
+    const [report, settingsFile, run] = await Promise.all([
+      getFile(REPORT_PATH), getFile(SETTINGS_PATH), getLastRun().catch(() => lastRun)]);
+    const remote = parseSettings(settingsFile?.text);
+    // Keep edits made so far (on this page or in a draft from an earlier visit) on top of the latest settings.
+    const [from, to] = base && settings ? [base, settings]
+      : draft?.repo === repo ? [draft.base, draft.settings] : [remote, remote];
+    settings = mergeSettings(from, to, remote);
+    base = remote;
     settingsSha = settingsFile?.sha;
-    setDirty(false);
+    lastRun = run;
+    fetchedAt = Date.now();
+    store.setJson("cache", { repo, report: report?.text ?? null, settings: settingsFile?.text ?? null, at: fetchedAt });
     if (!report) {
-      app.innerHTML = toolbar() + `<p class="message">No status page yet. It appears after the next daily run, or start one with “Run now”.</p>`;
-      app.querySelector(".toolbar").insertAdjacentHTML("afterbegin", `<button id="run-only">Run now</button>`);
+      reportText = "";
+      app.innerHTML = toolbar() + `<p class="message">No status page yet. It appears after the next daily run, or start one with “Run”.</p>`;
       bindToolbar();
-      document.getElementById("run-only").onclick = () => runNow().catch(e => notify(e.message, true));
-      return;
+    } else renderReport(report.text);
+    changed();
+    if (!polling && lastRun && lastRun.status !== "completed") {
+      const id = lastRun.id;
+      pollRun(async () => (await gh(`/actions/runs/${id}`)).json());
     }
-    renderReport(report.text);
   } catch (e) {
     if (/GitHub 401|GitHub 403/.test(e.message)) return setupView("The token was not accepted: " + e.message);
+    if (reportText) return notify(`Couldn't update: ${e.message}`, true);
     app.innerHTML = toolbar() + `<p class="message error">${escapeHtml(e.message)}</p>`;
     bindToolbar();
   }
 }
 
 function renderReport(htmlText) {
+  reportText = htmlText;
   const doc = new DOMParser().parseFromString(htmlText, "text/html");
   let style = document.getElementById("report-style");
   if (!style) { style = document.createElement("style"); style.id = "report-style"; document.head.prepend(style); }
@@ -215,14 +376,33 @@ function renderReport(htmlText) {
   bindToolbar();
   enhance();
   makeCollapsible();
+  updateBadge();
 }
 
-// Cards start closed; remember which ones were opened so a refresh keeps them open.
-const openCards = new Set();
+// Number of things to pick up or return soon on the home screen icon, where supported.
+function updateBadge() {
+  if (!navigator.setAppBadge) return;
+  const n = app.querySelectorAll(".attention .pickup-item, .attention .due-item").length;
+  (n ? navigator.setAppBadge(n) : navigator.clearAppBadge()).catch(() => {});
+}
+
+// Cards start closed; remember which ones were opened, also across visits.
+const openCards = new Set(store.json("openCards") || []);
+const collapsibleCards = () => [...app.querySelectorAll("section.card")].filter(c => c.querySelector(".card-head"));
+
+function setCardOpen(card, open) {
+  card.classList.toggle("open", open);
+  card.querySelector("header").setAttribute("aria-expanded", open);
+  open ? openCards.add(card.dataset.cat) : openCards.delete(card.dataset.cat);
+  store.setJson("openCards", [...openCards]);
+  const all = document.getElementById("toggle-all");
+  if (all) all.textContent = collapsibleCards().every(c => c.classList.contains("open")) ? "Close all" : "Open all";
+}
+
 function makeCollapsible() {
   for (const card of app.querySelectorAll("section.card")) {
     if (!card.querySelector(":scope > h3")) continue;
-    const cat = card.dataset.cat, header = card.querySelector("header");
+    const header = card.querySelector("header");
     const head = document.createElement("div"), body = document.createElement("div");
     head.className = "card-head"; body.className = "card-body";
     let inBody = false;
@@ -233,16 +413,12 @@ function makeCollapsible() {
     card.append(head, body);
     header.setAttribute("role", "button");
     header.tabIndex = 0;
-    const setOpen = open => {
-      card.classList.toggle("open", open);
-      header.setAttribute("aria-expanded", open);
-      open ? openCards.add(cat) : openCards.delete(cat);
-    };
-    const toggle = () => setOpen(!card.classList.contains("open"));
-    setOpen(openCards.has(cat));
+    const toggle = () => setCardOpen(card, !card.classList.contains("open"));
+    setCardOpen(card, openCards.has(card.dataset.cat));
     head.onclick = e => { if (!e.target.closest("button, input, a")) toggle(); };
     header.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } };
   }
+  document.getElementById("toggle-all").hidden = !collapsibleCards().length;
 }
 
 // ---------- controls on the status page ----------
@@ -269,7 +445,7 @@ function enhance() {
         const list = settings.priority[cat] || (settings.priority[cat] = []);
         const i = list.indexOf(key);
         i >= 0 ? list.splice(i, 1) : list.push(key);
-        paint(); setDirty(true);
+        paint(); changed();
       };
       paint();
       row.querySelector("td.title").prepend(btn);
@@ -293,7 +469,7 @@ function enhance() {
       btn.onclick = () => {
         const i = settings.returning.indexOf(id);
         i >= 0 ? settings.returning.splice(i, 1) : settings.returning.push(id);
-        paint(); setDirty(true);
+        paint(); changed();
       };
       paint();
       cell.prepend(btn);
@@ -307,7 +483,7 @@ function enhance() {
       const until = settings.paused_until[cat];
       if (until && parseIso(until) >= t) {
         box.innerHTML = `<span class="paused">Paused by you until ${fi(parseIso(until))}</span> <button class="ctl-clear">Remove pause</button>`;
-        box.querySelector(".ctl-clear").onclick = () => { delete settings.paused_until[cat]; paintPause(); setDirty(true); };
+        box.querySelector(".ctl-clear").onclick = () => { delete settings.paused_until[cat]; paintPause(); changed(); };
       } else {
         box.innerHTML = `Busy with something of my own: move everything
           <input type="number" min="1" max="365" value="14" inputmode="numeric" aria-label="days"> days later
@@ -316,7 +492,7 @@ function enhance() {
         const target = () => addDays(release > t ? release : t, Math.max(1, parseInt(input.value, 10) || 0));
         const showHint = () => hint.textContent = `→ nothing new before ${fi(target())}`;
         input.oninput = showHint; showHint();
-        box.querySelector(".ctl-apply").onclick = () => { settings.paused_until[cat] = iso(target()); paintPause(); setDirty(true); };
+        box.querySelector(".ctl-apply").onclick = () => { settings.paused_until[cat] = iso(target()); paintPause(); changed(); };
       }
     };
     paintPause();
@@ -343,65 +519,107 @@ function setDirty(on) {
   dirty = on;
   bar.classList.toggle("show", on);
   document.body.classList.toggle("has-savebar", on);
-  if (on) barInfo.textContent = "Unsaved changes";
+}
+
+// Call after every edit: updates the save bar and keeps unsaved edits as a draft in case the app is closed.
+function changed() {
+  const summary = changeSummary();
+  setDirty(summary.length > 0);
+  barInfo.textContent = summary.join(" · ");
+  dirty ? store.setJson("draft", { repo: cfg().repo, base, settings }) : store.del("draft");
 }
 
 async function save() {
   pruneSettings();
-  await putSettings();
-  setDirty(false);
+  const merged = await putSettings();
+  base = clone(settings);
+  const cache = store.json("cache");
+  if (cache) store.setJson("cache", { ...cache, settings: JSON.stringify(settings) });
+  if (merged) renderReport(reportText);
+  changed();
 }
 
 async function runNow() {
   const res = await gh(`/actions/workflows/${WORKFLOW}/dispatches`, { method: "POST",
     body: JSON.stringify({ ref: "main", inputs: { apply: "true" } }) });
   if (res.status === 404) throw new Error("Workflow not found (is the token allowed to use Actions?)");
+  const startedAt = Date.now();
+  pollRun(async () => {
+    const runs = await (await gh(`/actions/workflows/${WORKFLOW}/runs?per_page=1&event=workflow_dispatch`)).json();
+    const run = runs.workflow_runs?.[0];
+    return run && Date.parse(run.created_at) >= startedAt - 60000 ? run : null;
+  });
   notify("Run started. The page refreshes when it has finished (about 1–2 minutes).");
-  pollRun(Date.now());
 }
 
 function notify(text, isError) {
+  const bar = app.querySelector(".toolbar");
+  if (!bar) return;
   let el = document.getElementById("notice");
-  if (!el) { el = document.createElement("p"); el.id = "notice"; app.querySelector(".toolbar").after(el); }
+  if (!el) { el = document.createElement("p"); el.id = "notice"; bar.after(el); }
   el.className = "message" + (isError ? " error" : "");
   el.textContent = text;
 }
 
-function pollRun(startedAt) {
+// Waits for the run that getRun() returns (null until it exists) to finish, then reloads.
+function pollRun(getRun) {
   clearInterval(polling);
   let tries = 0;
   polling = setInterval(async () => {
     try {
       tries++;
-      const runs = await (await gh(`/actions/workflows/${WORKFLOW}/runs?per_page=1&event=workflow_dispatch`)).json();
-      const run = runs.workflow_runs?.[0];
-      if (run && Date.parse(run.created_at) >= startedAt - 60000 && run.status === "completed") {
-        clearInterval(polling);
+      const run = await getRun();
+      if (run?.status === "completed") {
+        stopPolling();
+        lastRun = run;
         await load();
         if (run.conclusion !== "success") notify(`The run finished with “${run.conclusion}”. Open GitHub Actions for details.`, true);
       } else if (tries > 40) {
-        clearInterval(polling);
+        stopPolling();
         notify("The run is taking long. Refresh later.");
       }
-    } catch (e) { clearInterval(polling); notify(e.message, true); }
+    } catch (e) { stopPolling(); notify(e.message, true); }
   }, 8000);
+  paintStatus();
+}
+
+function stopPolling() {
+  clearInterval(polling);
+  polling = null;
+  paintStatus();
 }
 
 async function withBusy(fn) {
   const buttons = bar.querySelectorAll("button");
   buttons.forEach(b => b.disabled = true);
   barInfo.textContent = "Saving…";
+  busy = true;
   try { await fn(); }
-  catch (e) { barInfo.textContent = "Failed: " + e.message; }
-  finally { buttons.forEach(b => b.disabled = false); }
+  catch (e) { dirty ? barInfo.textContent = "Failed: " + e.message : notify(e.message, true); }
+  finally { busy = false; buttons.forEach(b => b.disabled = false); }
 }
 document.getElementById("save").onclick = () => withBusy(async () => {
   await save(); notify("Saved. The next daily run uses these settings.");
 });
 document.getElementById("save-run").onclick = () => withBusy(async () => { await save(); await runNow(); });
-window.addEventListener("beforeunload", e => { if (dirty) e.preventDefault(); });
+document.getElementById("discard").onclick = () => {
+  if (!confirm("Discard unsaved changes?")) return;
+  settings = clone(base);
+  renderReport(reportText);
+  changed();
+};
 
-load();
+// Phones keep the app open in the background for days: update when it comes back.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && fetchedAt && !busy && Date.now() - fetchedAt > STALE_MS) load();
+});
+
+// The "Run now" shortcut on the home screen icon opens ?run=1.
+const runOnOpen = new URLSearchParams(location.search).has("run");
+if (runOnOpen) history.replaceState(null, "", location.pathname);
+load().then(() => {
+  if (runOnOpen && fetchedAt && !polling) runNow().catch(e => notify(e.message, true));
+});
 </script>
 </body>
 </html>
