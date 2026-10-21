@@ -70,10 +70,36 @@ body.has-savebar { padding-bottom: 70px; }
 .card-head h2::before { content: "▸"; display: inline-block; width: 1em; transition: transform .15s; }
 .card.open .card-head h2::before { transform: rotate(90deg); }
 .card:not(.open) .card-body { display: none; }
+/* Magazine search: a full-screen view over the status page. */
+.mags { position: fixed; inset: 0; z-index: 20; overflow-y: auto; background: var(--bg); }
+.mags[hidden] { display: none; }
+.mags-head { position: sticky; top: 0; display: flex; gap: 8px; padding: 10px 16px; background: var(--bg);
+  border-bottom: 1px solid var(--line); }
+.mags-head input { flex: 1; min-width: 0; font: inherit; font-size: 16px; padding: 8px 10px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--card); color: var(--text); }
+.mags-body { max-width: 640px; margin: 0 auto; padding: 4px 16px calc(24px + env(safe-area-inset-bottom)); }
+.mags-body .hint { color: var(--muted); }
+.mags-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.mags-chips button { border-radius: 999px; }
+.mag { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; margin: 10px 0; }
+.mag h2 { margin: 0 0 6px; font-size: 16px; }
+.mag h2 .hint { font-weight: normal; font-size: 13px; }
+.mag ul { list-style: none; margin: 0; padding: 0; }
+.mag li { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; border-top: 1px solid var(--line); }
+.mag li:first-child { border-top: 0; }
+.mag .issue { font-weight: 600; font-variant-numeric: tabular-nums; }
+.mag .dates { color: var(--muted); text-align: right; }
 </style>
 </head>
 <body>
 <div id="app"></div>
+<div class="mags" id="mags" hidden>
+  <div class="mags-head">
+    <input id="mags-q" type="search" placeholder="Magazine, e.g. Pelit" autocomplete="off" aria-label="Search borrowed magazines">
+    <button id="mags-close">Close</button>
+  </div>
+  <div class="mags-body" id="mags-body"></div>
+</div>
 <div class="savebar" id="savebar">
   <span class="info" id="savebar-info">Unsaved changes</span>
   <button id="discard">Discard</button>
@@ -85,6 +111,7 @@ body.has-savebar { padding-bottom: 70px; }
 const WORKFLOW = "daily.yml";
 const REPORT_PATH = "data/library-status.html";
 const SETTINGS_PATH = "data/settings.json";
+const MAGAZINES_PATH = "data/magazines.json";
 const DEFAULT_REPO = "scatterb/borrow-holds";
 const STALE_MS = 5 * 60 * 1000;    // refetch when the app comes back after this long
 const TOKEN_WARN_DAYS = 14;
@@ -100,6 +127,7 @@ const app = document.getElementById("app");
 // base: settings.json as last read from GitHub; settings: the same with the user's edits.
 let reportText = null, base = null, settings = null, settingsSha, dirty = false;
 let polling = null, busy = false, loading = null, fetchedAt = 0, lastRun = null;
+let magazines = null;  // data/magazines.json: {updated, issues: [{name, title, issue, borrowed, record}]}
 
 // ---------- GitHub API ----------
 function cfg() { return { repo: store.get("repo"), token: store.get("token") }; }
@@ -282,16 +310,17 @@ function statusHtml() {
 
 function toolbar() {
   return `<div class="toolbar"><span class="status">${statusHtml()}</span>
-    <button id="toggle-all" hidden></button><button id="run">▶ Run</button>
+    <button id="toggle-all" hidden></button><button id="mags-open">Magazines</button><button id="run">▶ Run</button>
     <button id="refresh">↻ Refresh</button><button id="signout">Sign out</button></div>`;
 }
 
 function bindToolbar() {
   document.getElementById("refresh").onclick = () => load();
+  document.getElementById("mags-open").onclick = () => openMagazines();
   document.getElementById("signout").onclick = () => {
     if (!confirm("Remove the access token and the saved copy from this browser?" + (dirty ? " Unsaved changes are lost." : ""))) return;
     for (const k of ["token", "cache", "draft"]) store.del(k);
-    reportText = base = settings = lastRun = null;
+    reportText = base = settings = lastRun = magazines = null;
     setDirty(false);
     navigator.clearAppBadge?.().catch(() => {});
     setupView();
@@ -329,6 +358,7 @@ async function fetchAll() {
     const cache = store.json("cache");
     if (cache?.repo === repo && cache.report) {
       base = parseSettings(cache.settings);
+      magazines = parseMagazines(cache.magazines);
       settings = draft?.repo === repo ? mergeSettings(draft.base, draft.settings, base) : clone(base);
       renderReport(cache.report);
       changed();
@@ -336,8 +366,9 @@ async function fetchAll() {
     } else app.innerHTML = `<p class="message">Loading…</p>`;
   }
   try {
-    const [report, settingsFile, run] = await Promise.all([
-      getFile(REPORT_PATH), getFile(SETTINGS_PATH), getLastRun().catch(() => lastRun)]);
+    const [report, settingsFile, run, magazinesFile] = await Promise.all([
+      getFile(REPORT_PATH), getFile(SETTINGS_PATH), getLastRun().catch(() => lastRun),
+      getFile(MAGAZINES_PATH).catch(() => undefined)]);
     const remote = parseSettings(settingsFile?.text);
     // Keep edits made so far (on this page or in a draft from an earlier visit) on top of the latest settings.
     const [from, to] = base && settings ? [base, settings]
@@ -346,8 +377,11 @@ async function fetchAll() {
     base = remote;
     settingsSha = settingsFile?.sha;
     lastRun = run;
+    if (magazinesFile !== undefined) magazines = parseMagazines(magazinesFile?.text);  // keep the old copy on errors
     fetchedAt = Date.now();
-    store.setJson("cache", { repo, report: report?.text ?? null, settings: settingsFile?.text ?? null, at: fetchedAt });
+    store.setJson("cache", { repo, report: report?.text ?? null, settings: settingsFile?.text ?? null,
+                             magazines: magazines && JSON.stringify(magazines), at: fetchedAt });
+    renderMagazines();
     if (!report) {
       reportText = "";
       app.innerHTML = toolbar() + `<p class="message">No status page yet. It appears after the next daily run, or start one with “Run”.</p>`;
@@ -513,6 +547,69 @@ function pruneSettings() {
   for (const [cat, until] of Object.entries(settings.paused_until)) if (until < t) delete settings.paused_until[cat];
 }
 
+// ---------- magazine search ----------
+const magsView = document.getElementById("mags"), magsQuery = document.getElementById("mags-q");
+const magsBody = document.getElementById("mags-body");
+const parseMagazines = text => { try { return text ? JSON.parse(text) : null; } catch { return null; } };
+// Case and accent insensitive: "skona" finds "Sköna hem".
+const fold = s => s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+// "2026:17" -> [2026, 17]; double issues like "2026:3-4" sort by their first number.
+const issueKey = issue => (issue || "").split(":").map(n => parseInt(n, 10) || 0);
+const newerIssue = (a, b) => { const [x, y] = [issueKey(a), issueKey(b)]; return (y[0] - x[0]) || ((y[1] || 0) - (x[1] || 0)); };
+
+// The Android back button closes the view instead of leaving the app.
+function openMagazines() {
+  if (magsView.hidden) history.pushState({ mags: 1 }, "");
+  magsView.hidden = false;
+  document.body.style.overflow = "hidden";
+  renderMagazines();
+  magsQuery.focus();
+  magsQuery.select();
+}
+function hideMagazines() {
+  magsView.hidden = true;
+  document.body.style.overflow = "";
+}
+document.getElementById("mags-close").onclick = () => history.state?.mags ? history.back() : hideMagazines();
+window.addEventListener("popstate", () => { if (!magsView.hidden) hideMagazines(); });
+magsQuery.oninput = () => renderMagazines();
+
+function renderMagazines() {
+  if (magsView.hidden) return;
+  const issues = magazines?.issues || [];
+  if (!issues.length) {
+    magsBody.innerHTML = `<p class="hint">No magazine loans yet. They appear after the next daily run, or start one with “Run”.</p>`;
+    return;
+  }
+  // Issues are newest borrowed first, so names come out most recently borrowed first.
+  const byName = new Map();
+  for (const e of issues) {
+    if (!byName.has(e.name)) byName.set(e.name, []);
+    byName.get(e.name).push(e);
+  }
+  const updated = magazines.updated ? `Loans up to ${fi(parseIso(magazines.updated))}.` : "";
+  const q = fold(magsQuery.value.trim());
+  if (!q) {
+    magsBody.innerHTML = `<p class="hint">Type a name, or pick one. ${updated}</p><div class="mags-chips">${
+      [...byName.keys()].map(n => `<button data-name="${escapeHtml(n)}">${escapeHtml(n)}</button>`).join("")}</div>`;
+    for (const b of magsBody.querySelectorAll("[data-name]"))
+      b.onclick = () => { magsQuery.value = b.dataset.name; renderMagazines(); };
+    return;
+  }
+  const hits = [...byName].filter(([name, list]) => fold(name).includes(q) || list.some(e => fold(e.title).includes(q)));
+  magsBody.innerHTML = (hits.length ? hits.map(([name, list]) => {
+    // One line per issue, newest issue first, with every date it was borrowed.
+    const dates = new Map();
+    for (const e of list) dates.set(e.issue, [...(dates.get(e.issue) || []), fi(parseIso(e.borrowed))]);
+    const rows = [...dates].sort(([a], [b]) => newerIssue(a, b)).map(([issue, ds]) =>
+      `<li><span class="issue">${escapeHtml(issue ? issue.replace(":", " : ") : "?")}</span>
+           <span class="dates">${ds.map(escapeHtml).join(", ")}</span></li>`).join("");
+    return `<section class="mag"><h2>${escapeHtml(name)} <span class="hint">${dates.size} issue${dates.size === 1 ? "" : "s"}</span></h2>
+      <ul>${rows}</ul></section>`;
+  }).join("") : `<p class="hint">No borrowed magazine matches “${escapeHtml(magsQuery.value.trim())}”.</p>`)
+    + `<p class="hint">${updated}</p>`;
+}
+
 // ---------- saving & running ----------
 const bar = document.getElementById("savebar"), barInfo = document.getElementById("savebar-info");
 function setDirty(on) {
@@ -614,10 +711,12 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && fetchedAt && !busy && Date.now() - fetchedAt > STALE_MS) load();
 });
 
-// The "Run now" shortcut on the home screen icon opens ?run=1.
-const runOnOpen = new URLSearchParams(location.search).has("run");
-if (runOnOpen) history.replaceState(null, "", location.pathname);
+// Shortcuts on the home screen icon: "Run now" opens ?run=1, "Magazines" ?mags=1.
+const params = new URLSearchParams(location.search), runOnOpen = params.has("run");
+if (runOnOpen || params.has("mags")) history.replaceState(null, "", location.pathname);
+const magsOnOpen = params.has("mags");
 load().then(() => {
+  if (magsOnOpen && store.get("token")) openMagazines();
   if (runOnOpen && fetchedAt && !polling) runNow().catch(e => notify(e.message, true));
 });
 </script>

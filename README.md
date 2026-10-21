@@ -17,6 +17,8 @@ Published with GitHub Pages (Settings → Pages → Deploy from branch → main 
   refreshes when the app comes back to the foreground after a few minutes.
 - The toolbar shows the last workflow run (✓ / ✗, linking to GitHub Actions) and
   follows a run in progress. **▶ Run** starts a run (saving first if needed).
+- **Magazines** searches the magazines you have borrowed (`data/magazines.json`): each
+  issue newest first, with the dates you borrowed it. Also a home screen shortcut (Android).
 - Cards are collapsible, remember which ones were open, and can be opened or closed all at once.
 - Optional token expiry date in the setup: a reminder appears 14 days before.
 - Installed as an app: a "Run now" shortcut on the home screen icon (Android) and a badge
