@@ -49,6 +49,14 @@ button:disabled { opacity: .5; cursor: default; }
 .savebar.show { display: flex; }
 .savebar .info { color: var(--muted); margin-right: 6px; }
 body.has-savebar { padding-bottom: 70px; }
+/* Collapsible cards: the part above Borrowed/Reserved toggles the tables. */
+.card-head { cursor: pointer; padding-bottom: 6px; -webkit-tap-highlight-color: transparent; }
+.card-head .ctl-pause { cursor: auto; }
+.card-head header { user-select: none; }
+.card-head header:focus-visible { outline: 2px solid var(--accent, var(--accent-ui)); outline-offset: 2px; border-radius: 4px; }
+.card-head h2::before { content: "▸"; display: inline-block; width: 1em; transition: transform .15s; }
+.card.open .card-head h2::before { transform: rotate(90deg); }
+.card:not(.open) .card-body { display: none; }
 </style>
 </head>
 <body>
@@ -206,6 +214,35 @@ function renderReport(htmlText) {
   app.innerHTML = toolbar() + (doc.querySelector("main")?.outerHTML || "");
   bindToolbar();
   enhance();
+  makeCollapsible();
+}
+
+// Cards start closed; remember which ones were opened so a refresh keeps them open.
+const openCards = new Set();
+function makeCollapsible() {
+  for (const card of app.querySelectorAll("section.card")) {
+    if (!card.querySelector(":scope > h3")) continue;
+    const cat = card.dataset.cat, header = card.querySelector("header");
+    const head = document.createElement("div"), body = document.createElement("div");
+    head.className = "card-head"; body.className = "card-body";
+    let inBody = false;
+    for (const el of [...card.children]) {
+      if (el.tagName === "H3") inBody = true;
+      (inBody ? body : head).append(el);
+    }
+    card.append(head, body);
+    header.setAttribute("role", "button");
+    header.tabIndex = 0;
+    const setOpen = open => {
+      card.classList.toggle("open", open);
+      header.setAttribute("aria-expanded", open);
+      open ? openCards.add(cat) : openCards.delete(cat);
+    };
+    const toggle = () => setOpen(!card.classList.contains("open"));
+    setOpen(openCards.has(cat));
+    head.onclick = e => { if (!e.target.closest("button, input, a")) toggle(); };
+    header.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } };
+  }
 }
 
 // ---------- controls on the status page ----------
