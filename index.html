@@ -56,6 +56,12 @@ button:disabled { opacity: .5; cursor: default; }
   background: var(--card); color: var(--text); }
 .ctl-pause .hint { color: var(--muted); }
 .ctl-pause .paused { font-weight: 600; color: var(--accent, var(--accent-ui)); }
+.ctl-sorted { display: flex; align-items: center; gap: 8px; }
+.ctl-sort { margin-left: auto; display: inline-flex; text-transform: none; letter-spacing: 0; font-weight: 400; }
+.ctl-sort button { font-size: 12px; padding: 1px 8px; border-radius: 0; color: var(--muted); }
+.ctl-sort button:first-child { border-radius: 6px 0 0 6px; }
+.ctl-sort button:last-child { border-radius: 0 6px 6px 0; border-left: 0; }
+.ctl-sort button[aria-pressed="true"] { background: var(--line); color: var(--text); }
 .savebar { position: fixed; left: 0; right: 0; bottom: 0; display: none; justify-content: center; gap: 8px; flex-wrap: wrap;
   align-items: center; padding: 10px 16px calc(10px + env(safe-area-inset-bottom)); background: var(--card);
   border-top: 1px solid var(--line); box-shadow: 0 -4px 16px rgba(0,0,0,.08); z-index: 10; }
@@ -409,6 +415,7 @@ function renderReport(htmlText) {
   app.innerHTML = toolbar() + (doc.querySelector("main")?.outerHTML || "");
   bindToolbar();
   enhance();
+  addLoanSort();
   makeCollapsible();
   updateBadge();
 }
@@ -532,6 +539,38 @@ function enhance() {
     paintPause();
     (card.querySelector(".release") || card.querySelector("header")).after(box);
   }
+}
+
+// Borrowed tables come sorted by due date; optionally fewest renewals left first (unknown last),
+// ties keeping the due date order. Loans reserved by others can't be renewed, so they count as 0.
+// The choice applies to every card and is remembered.
+function addLoanSort() {
+  const renewals = row => {
+    if ([...row.querySelectorAll(".badge")].some(b => b.textContent.trim() === "Reserved by others")) return 0;
+    const n = parseInt(row.querySelector("td.num")?.textContent, 10);
+    return isNaN(n) ? Infinity : n;
+  };
+  const tables = [];
+  for (const h3 of app.querySelectorAll("section.card h3")) {
+    const tbody = h3.nextElementSibling?.querySelector("tbody");
+    if (!tbody?.querySelector("tr.loan")) continue;
+    [...tbody.rows].forEach((row, i) => row.dataset.order = i);
+    h3.classList.add("ctl-sorted");
+    h3.insertAdjacentHTML("beforeend", `<span class="ctl-sort" role="group" aria-label="Sort">
+      <button data-sort="due">Due</button><button data-sort="renewals">Renewals left</button></span>`);
+    tables.push([h3, tbody]);
+  }
+  const apply = by => {
+    store.set("loanSort", by);
+    for (const [h3, tbody] of tables) {
+      const rows = [...tbody.rows].sort((a, b) =>
+        (by === "renewals" ? renewals(a) - renewals(b) || 0 : 0) || a.dataset.order - b.dataset.order);
+      tbody.append(...rows);
+      for (const b of h3.querySelectorAll("[data-sort]")) b.setAttribute("aria-pressed", b.dataset.sort === by);
+    }
+  };
+  for (const [h3] of tables) for (const b of h3.querySelectorAll("[data-sort]")) b.onclick = () => apply(b.dataset.sort);
+  apply(store.get("loanSort") === "renewals" ? "renewals" : "due");
 }
 
 // Drop settings that no longer match anything on the page (returned loans, collected holds, past pauses).
