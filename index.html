@@ -57,6 +57,8 @@ button:disabled { opacity: .5; cursor: default; }
 .ctl-star { border: 0; background: none; padding: 0 4px 0 0; font-size: 18px; line-height: 1; color: var(--muted); vertical-align: -1px; }
 .ctl-star.on { color: #e6a700; }
 .ctl-return { font-size: 12px; padding: 2px 8px; border-radius: 6px; }
+.ctl-notice { font-size: 12px; padding: 2px 8px; border-radius: 6px; margin-left: 8px; }
+.attention .new-item.noticed { opacity: .55; }
 .ctl-return.on { background: var(--accent, var(--accent-ui)); border-color: transparent; color: #fff; }
 .ctl-pause { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 8px 0 2px; font-size: 13px; }
 .ctl-pause input { width: 56px; font: inherit; padding: 3px 6px; border-radius: 6px; border: 1px solid var(--line);
@@ -209,7 +211,7 @@ async function putSettings() {
 }
 
 // ---------- settings ----------
-const defaultSettings = () => ({ priority: {}, returning: [], paused_until: {} });
+const defaultSettings = () => ({ priority: {}, returning: [], paused_until: {}, noticed: [] });
 const parseSettings = text => Object.assign(defaultSettings(), text ? JSON.parse(text) : {});
 const clone = o => JSON.parse(JSON.stringify(o));
 const keysOf = (...objs) => new Set(objs.flatMap(o => Object.keys(o || {})));
@@ -222,6 +224,7 @@ function mergeSettings(from, to, onto) {
     return [...c.filter(x => !removed.includes(x)), ...b.filter(x => !a.includes(x) && !c.includes(x))];
   };
   out.returning = mergeList(from.returning, to.returning, onto.returning);
+  out.noticed = mergeList(from.noticed, to.noticed, onto.noticed);
   for (const cat of keysOf(from.priority, to.priority, onto.priority)) {
     const list = mergeList(from.priority[cat], to.priority[cat], onto.priority[cat]);
     list.length ? out.priority[cat] = list : delete out.priority[cat];
@@ -246,11 +249,13 @@ function changeSummary() {
     starred += add; unstarred += rem;
   }
   const [returning, notReturning] = diff(base.returning, settings.returning);
+  const [noticed, unnoticed] = diff(base.noticed, settings.noticed);
   for (const cat of keysOf(base.paused_until, settings.paused_until)) {
     const until = settings.paused_until[cat];
     if (until !== base.paused_until[cat]) until ? paused++ : unpaused++;
   }
   return [[starred, "starred"], [unstarred, "unstarred"], [returning, "returning"], [notReturning, "not returning"],
+          [noticed, "noticed"], [unnoticed, "not noticed"],
           [paused, paused === 1 ? "pause" : "pauses"], [unpaused, unpaused === 1 ? "pause removed" : "pauses removed"]]
     .filter(([n]) => n).map(([n, text]) => `${n} ${text}`);
 }
@@ -545,6 +550,27 @@ function makeCollapsible() {
 // ---------- controls on the status page ----------
 function enhance() {
   const t = today();
+
+  // "New in circulation" stays flagged until noticed here (the next run drops it).
+  for (const item of app.querySelectorAll(".attention .new-item[data-new-copies]")) {
+    const id = item.dataset.newCopies;
+    const btn = document.createElement("button");
+    btn.className = "ctl-notice";
+    btn.title = "Dismiss: the next run stops flagging it";
+    const paint = () => {
+      const on = settings.noticed.includes(id);
+      item.classList.toggle("noticed", on);
+      btn.textContent = on ? "Noticed ✓" : "Got it";
+      for (const badge of app.querySelectorAll(`tr.hold[data-new-copies="${CSS.escape(id)}"] .badge.new`)) badge.style.display = on ? "none" : "";
+    };
+    btn.onclick = () => {
+      const i = settings.noticed.indexOf(id);
+      i >= 0 ? settings.noticed.splice(i, 1) : settings.noticed.push(id);
+      paint(); changed();
+    };
+    paint();
+    item.append(btn);
+  }
   for (const card of app.querySelectorAll("section.card[data-managed='1']")) {
     const cat = card.dataset.cat;
 
@@ -659,6 +685,8 @@ function pruneSettings() {
   const loanIds = new Set([...app.querySelectorAll("tr.loan[data-record]")].map(r => r.dataset.record));
   const holdKeys = new Set([...app.querySelectorAll("tr.hold[data-key]")].map(r => r.dataset.key));
   settings.returning = settings.returning.filter(id => loanIds.has(id));
+  const flagged = new Set([...app.querySelectorAll("[data-new-copies]")].map(el => el.dataset.newCopies));
+  settings.noticed = settings.noticed.filter(id => flagged.has(id));
   for (const cat of Object.keys(settings.priority)) {
     settings.priority[cat] = settings.priority[cat].filter(k => holdKeys.has(k));
     if (!settings.priority[cat].length) delete settings.priority[cat];

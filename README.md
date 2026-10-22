@@ -11,6 +11,9 @@ Published with GitHub Pages (Settings → Pages → Deploy from branch → main 
 
 - Star reservations, mark loans as returning and pause a format; the save bar lists
   the pending changes and can save, save & run, or discard them.
+- A reservation the library had only ordered is flagged **New in circulation** once it has
+  copies (green badge and a box on top), so you can star it. **Got it** dismisses the flag;
+  otherwise it goes away after 14 days or when the item is on its way.
 - Unsaved changes are kept as a draft in the browser, so closing the app loses nothing.
   If `settings.json` changed on GitHub meanwhile, your edits are merged on top of it.
 - Opens instantly with the last saved copy and updates it in the background; also
