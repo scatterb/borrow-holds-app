@@ -30,3 +30,21 @@ Published with GitHub Pages (Settings → Pages → Deploy from branch → main 
   with the number of things to pick up or return (where the browser supports badges).
 
 Sign out removes the token, the saved copy and any draft from the browser.
+
+## Code layout
+
+Plain HTML, CSS and native ES modules: no build step, GitHub Pages serves the files as they are.
+
+- `index.html`: the page's markup, including the setup view and toolbar as `<template>`s.
+- `style.css`: the app's own styles (the status page brings its own).
+- `js/main.js`: entry point: first load, home screen shortcuts, refresh when the app comes back.
+- `js/state.js`: state shared by the modules, kept in one `state` object.
+- `js/github.js`: GitHub API calls; `js/settings.js`: parsing and merging `settings.json`.
+- `js/load.js`: loads everything, showing the saved copy first.
+- `js/report.js`: shows the status page; `js/controls.js`: the stars, Done, Got it and pause controls on it.
+- `js/saving.js`: save bar, draft, saving, running the workflow and following the run.
+- `js/setup.js`, `js/toolbar.js`, `js/magazines.js`: the setup view, toolbar and magazine search.
+- `js/config.js`, `js/store.js`, `js/dates.js`, `js/util.js`: constants and small helpers.
+
+GitHub Pages lets browsers cache files for about 10 minutes, so right after a push a phone may mix
+old and new files for a while. A refresh after a few minutes fixes it.
