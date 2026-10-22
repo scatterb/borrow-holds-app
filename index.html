@@ -13,11 +13,11 @@
 /* App chrome only; the status page brings its own styles. */
 :root {
   --bg: #f5f6f8; --card: #ffffff; --text: #1d2026; --muted: #6b7280; --line: #e5e7eb;
-  --btn: #1d2026; --btn-text: #ffffff; --accent-ui: #2563eb; --danger: #c62828;
+  --btn: #1d2026; --btn-text: #ffffff; --accent-ui: #2563eb; --danger: #c62828; --violet: #7c3aed;
 }
 @media (prefers-color-scheme: dark) {
   :root { --bg: #14161a; --card: #1e2126; --text: #e8eaed; --muted: #9aa0a8; --line: #2e3238;
-    --btn: #e8eaed; --btn-text: #14161a; --accent-ui: #6ea2ff; --danger: #ef6b6b; }
+    --btn: #e8eaed; --btn-text: #14161a; --accent-ui: #6ea2ff; --danger: #ef6b6b; --violet: #a78bfa; }
 }
 body { margin: 0; background: var(--bg); color: var(--text);
   font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
@@ -29,10 +29,17 @@ body { margin: 0; background: var(--bg); color: var(--text);
 .toolbar .run.running { color: var(--accent-ui); }
 button.warn { color: var(--danger); border-color: var(--danger); }
 @media (max-width: 600px) {
-  .toolbar .status { flex-basis: 100%; }
-  .toolbar .status:empty { display: none; }
   .toolbar button { padding: 6px 10px; }
 }
+/* Burger menu for the less used actions */
+.menu { position: relative; }
+.menu-pop { position: absolute; right: 0; top: calc(100% + 4px); z-index: 15; display: flex; flex-direction: column;
+  min-width: 160px; padding: 4px; background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 6px 20px rgba(0,0,0,.15); }
+.menu-pop[hidden] { display: none; }
+.toolbar .menu-pop button { border: 0; background: none; text-align: left; padding: 8px 12px; border-radius: 6px; }
+.menu-pop button:hover:not(:disabled) { background: var(--line); }
+.menu-pop hr { border: 0; border-top: 1px solid var(--line); margin: 4px 0; }
 button, .btn { font: inherit; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text);
   padding: 6px 12px; cursor: pointer; }
 button.primary { background: var(--btn); color: var(--btn-text); border-color: var(--btn); }
@@ -68,6 +75,19 @@ button:disabled { opacity: .5; cursor: default; }
 .savebar.show { display: flex; }
 .savebar .info { color: var(--muted); margin-right: 6px; }
 body.has-savebar { padding-bottom: 70px; }
+/* Summary counts as coloured pills; zeros fade back. */
+.summary span { --c: var(--muted); color: var(--c); font-weight: 500;
+  background: color-mix(in srgb, var(--c) 13%, var(--card)); border-color: color-mix(in srgb, var(--c) 40%, var(--card)); }
+.summary b { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.summary .s-borrowed { --c: var(--accent-ui); }
+.summary .s-reserved { --c: var(--violet); }
+.summary .s-pickup { --c: var(--warn, #b26a00); }
+.summary .s-transit { --c: var(--ok, #1b7f45); }
+.summary .zero { --c: var(--muted); font-weight: 400; }
+/* Row above the cards: "Nothing to pick up…" on the left, Open all / Close all on the right. */
+.ctl-gridbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 10px; }
+.ctl-gridbar .all-clear { flex: 1 1 0; min-width: 0; margin: 0; }
+.ctl-gridbar #toggle-all { margin-left: auto; }
 /* Collapsible cards: the part above Borrowed/Reserved toggles the tables. */
 .card-head { cursor: pointer; padding-bottom: 6px; -webkit-tap-highlight-color: transparent; }
 .card-head .ctl-pause { cursor: auto; }
@@ -133,6 +153,7 @@ const app = document.getElementById("app");
 // base: settings.json as last read from GitHub; settings: the same with the user's edits.
 let reportText = null, base = null, settings = null, settingsSha, dirty = false;
 let polling = null, busy = false, loading = null, fetchedAt = 0, lastRun = null;
+let reportMeta = null;  // {at, mode} from the status page's "Updated 22.10.2026 09:11 · changes applied"
 let magazines = null;  // data/magazines.json: {updated, issues: [{name, title, issue, borrowed, record}]}
 
 // ---------- GitHub API ----------
@@ -298,13 +319,18 @@ function escapeHtml(s) {
 }
 
 function statusHtml() {
+  // One line for both the status page's age and the last run: they only differ when a run fails or is going on.
   let html = "";
-  if (polling) html += `<span class="run running">Run in progress…</span>`;
+  const updated = reportMeta && `Updated ${when(reportMeta.at)}`
+    + (reportMeta.mode && reportMeta.mode !== "changes applied" ? ` · ${escapeHtml(reportMeta.mode)}` : "");
+  if (polling) html += `<span class="run running">${updated ? updated + " · " : ""}Run in progress…</span>`;
   else if (lastRun) {
     const done = lastRun.status === "completed", ok = lastRun.conclusion === "success";
+    const label = !updated ? `Last run ${when(lastRun.created_at)}`
+      : done && !ok ? `${updated} · last run ${when(lastRun.created_at)}` : updated;
     html += `<a class="run${done && !ok ? " failed" : ""}" href="${escapeHtml(lastRun.html_url)}" target="_blank" rel="noopener"
-      title="${done ? escapeHtml(lastRun.conclusion) : "running"}">Last run ${when(lastRun.created_at)} ${!done ? "…" : ok ? "✓" : "✗"}</a>`;
-  }
+      title="Last run ${when(lastRun.created_at)}: ${done ? escapeHtml(lastRun.conclusion) : "running"}">${label} ${!done ? "…" : ok ? "✓" : "failed ✗"}</a>`;
+  } else if (updated) html += `<span class="run">${updated}</span>`;
   const expires = store.get("tokenExpires");
   if (expires) {
     const days = daysFrom(today(), parseIso(expires));
@@ -316,17 +342,35 @@ function statusHtml() {
 
 function toolbar() {
   return `<div class="toolbar"><span class="status">${statusHtml()}</span>
-    <button id="toggle-all" hidden></button><button id="mags-open">Magazines</button><button id="run">▶ Run</button>
-    <button id="refresh">↻ Refresh</button><button id="signout">Sign out</button></div>`;
+    <button id="mags-open">Magazines</button>
+    <div class="menu"><button id="menu-btn" aria-label="Menu" aria-haspopup="true" aria-expanded="false">☰</button>
+      <div class="menu-pop" id="menu" hidden><button id="run">▶ Run now</button><button id="refresh">↻ Refresh</button>
+        <hr><button id="signout">Sign out</button></div></div></div>`;
 }
 
+function closeMenu() {
+  const menu = document.getElementById("menu");
+  if (!menu || menu.hidden) return;
+  menu.hidden = true;
+  document.getElementById("menu-btn").setAttribute("aria-expanded", false);
+}
+document.addEventListener("click", e => { if (!e.target.closest(".menu")) closeMenu(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeMenu(); });
+
 function bindToolbar() {
+  const menu = document.getElementById("menu"), menuBtn = document.getElementById("menu-btn");
+  menuBtn.onclick = () => {
+    if (!menu.hidden) return closeMenu();
+    menu.hidden = false;
+    menuBtn.setAttribute("aria-expanded", true);
+  };
+  menu.onclick = e => { if (e.target.closest("button")) closeMenu(); };
   document.getElementById("refresh").onclick = () => load();
   document.getElementById("mags-open").onclick = () => openMagazines();
   document.getElementById("signout").onclick = () => {
     if (!confirm("Remove the access token and the saved copy from this browser?" + (dirty ? " Unsaved changes are lost." : ""))) return;
     for (const k of ["token", "cache", "draft"]) store.del(k);
-    reportText = base = settings = lastRun = magazines = null;
+    reportText = base = settings = lastRun = magazines = reportMeta = null;
     setDirty(false);
     navigator.clearAppBadge?.().catch(() => {});
     setupView();
@@ -334,10 +378,6 @@ function bindToolbar() {
   document.getElementById("run").onclick = () => dirty
     ? withBusy(async () => { await save(); await runNow(); })
     : runNow().catch(e => notify(e.message, true));
-  document.getElementById("toggle-all").onclick = () => {
-    const cards = collapsibleCards(), open = !cards.every(c => c.classList.contains("open"));
-    cards.forEach(c => setCardOpen(c, open));
-  };
   paintStatus();
 }
 
@@ -390,7 +430,8 @@ async function fetchAll() {
     renderMagazines();
     if (!report) {
       reportText = "";
-      app.innerHTML = toolbar() + `<p class="message">No status page yet. It appears after the next daily run, or start one with “Run”.</p>`;
+      reportMeta = null;
+      app.innerHTML = toolbar() + `<p class="message">No status page yet. It appears after the next daily run, or start one with “Run now” in the ☰ menu.</p>`;
       bindToolbar();
     } else renderReport(report.text);
     changed();
@@ -413,11 +454,33 @@ function renderReport(htmlText) {
   if (!style) { style = document.createElement("style"); style.id = "report-style"; document.head.prepend(style); }
   style.textContent = [...doc.querySelectorAll("style")].map(s => s.textContent).join("\n");
   app.innerHTML = toolbar() + (doc.querySelector("main")?.outerHTML || "");
+  takeMeta();
   bindToolbar();
+  styleSummary();
   enhance();
   addLoanSort();
   makeCollapsible();
   updateBadge();
+}
+
+// The toolbar shows the page's "Updated …" together with the last run, so take it out of the page.
+function takeMeta() {
+  const meta = app.querySelector(".top .meta");
+  const m = meta?.textContent.match(/Updated (\d+)\.(\d+)\.(\d+) (\d+):(\d+)(?: · (.*))?/);
+  reportMeta = m && { at: new Date(m[3], m[2] - 1, m[1], m[4], m[5]), mode: (m[6] || "").trim() };
+  if (reportMeta) meta.remove();
+}
+
+// "23 borrowed" -> bold number and a colour per kind.
+function styleSummary() {
+  const kinds = [["borrowed", "s-borrowed"], ["reserved", "s-reserved"], ["waiting", "s-pickup"], ["on the way", "s-transit"]];
+  for (const span of app.querySelectorAll(".summary span")) {
+    const m = span.textContent.trim().match(/^(\d+)\s+(.*)$/);
+    if (!m) continue;
+    span.innerHTML = `<b>${m[1]}</b> ${escapeHtml(m[2])}`;
+    span.className = kinds.find(([word]) => m[2].startsWith(word))?.[1] || "";
+    span.classList.toggle("zero", m[1] === "0");
+  }
 }
 
 // Number of things to pick up or return soon on the home screen icon, where supported.
@@ -436,6 +499,10 @@ function setCardOpen(card, open) {
   card.querySelector("header").setAttribute("aria-expanded", open);
   open ? openCards.add(card.dataset.cat) : openCards.delete(card.dataset.cat);
   store.setJson("openCards", [...openCards]);
+  paintToggleAll();
+}
+
+function paintToggleAll() {
   const all = document.getElementById("toggle-all");
   if (all) all.textContent = collapsibleCards().every(c => c.classList.contains("open")) ? "Close all" : "Open all";
 }
@@ -459,7 +526,20 @@ function makeCollapsible() {
     head.onclick = e => { if (!e.target.closest("button, input, a")) toggle(); };
     header.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } };
   }
-  document.getElementById("toggle-all").hidden = !collapsibleCards().length;
+  // Open all / Close all sits right above the cards, sharing the row with "Nothing to pick up…" when that is shown.
+  const cards = collapsibleCards(), grid = app.querySelector(".grid");
+  if (!cards.length || !grid) return;
+  const row = document.createElement("div");
+  row.className = "ctl-gridbar";
+  const clear = app.querySelector(".all-clear");
+  if (clear) row.append(clear);
+  row.insertAdjacentHTML("beforeend", `<button id="toggle-all"></button>`);
+  grid.before(row);
+  row.querySelector("#toggle-all").onclick = () => {
+    const open = !cards.every(c => c.classList.contains("open"));
+    cards.forEach(c => setCardOpen(c, open));
+  };
+  paintToggleAll();
 }
 
 // ---------- controls on the status page ----------
@@ -617,7 +697,7 @@ function renderMagazines() {
   if (magsView.hidden) return;
   const issues = magazines?.issues || [];
   if (!issues.length) {
-    magsBody.innerHTML = `<p class="hint">No magazine loans yet. They appear after the next daily run, or start one with “Run”.</p>`;
+    magsBody.innerHTML = `<p class="hint">No magazine loans yet. They appear after the next daily run, or start one with “Run now” in the ☰ menu.</p>`;
     return;
   }
   // Issues are newest borrowed first, so names come out most recently borrowed first.
